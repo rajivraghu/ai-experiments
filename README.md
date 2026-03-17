@@ -1,9 +1,9 @@
 # ai-experiments
 
-Python web UI app for Gemini image generation using:
-- a **reference image upload**
-- a **prompt input**
-- an **API key input in the UI**
+Python web UI app for Gemini generation with:
+- **Image mode**: upload a reference image + prompt to generate an image.
+- **Audio mode**: provide a script to generate speech audio.
+- **API key input directly in the UI**.
 
 ## Setup
 
