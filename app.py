@@ -761,6 +761,9 @@ def reset_review_state(
     st.session_state["review_voice_name"] = voice_name
     st.session_state["review_current_index"] = 0
     st.session_state["review_results"] = []
+    st.session_state["review_skipped_titles"] = []
+    st.session_state["review_last_result"] = None
+    st.session_state["review_auto_run"] = True
     st.session_state["review_pending_result"] = None
     st.session_state["review_preview_open"] = False
     st.session_state["review_final_video_bytes"] = None
@@ -894,7 +897,7 @@ def render_app() -> None:
                         st.write(item.summary)
                         st.caption(item.article_url)
         with col2:
-            start_review = st.button("Start / Reset reviewed clip flow", type="primary")
+            start_review = st.button("Start / Reset auto flow", type="primary")
 
         if start_review:
             if not gemini_api_key:
@@ -917,103 +920,99 @@ def render_app() -> None:
                         voice_name=voice_name.strip() or DEFAULT_VOICE,
                     )
                     st.success(
-                        "Review flow started. Generate one clip, preview it, then continue to the next story."
+                        "Auto-approve flow started. Clips will proceed automatically unless you stop the run."
                     )
                     append_log(f"Started reviewed clip flow for {len(items)} stories.")
+                    st.rerun()
 
         review_items = st.session_state.get("review_items", [])
         review_results: list[StoryResult] = st.session_state.get("review_results", [])
-        review_pending_result: Optional[StoryResult] = st.session_state.get("review_pending_result")
+        review_last_result: Optional[StoryResult] = st.session_state.get("review_last_result")
+        review_skipped_titles: list[str] = st.session_state.get("review_skipped_titles", [])
         review_current_index = st.session_state.get("review_current_index", 0)
-        review_preview_open = st.session_state.get("review_preview_open", False)
+        review_auto_run = st.session_state.get("review_auto_run", False)
         review_final_video_bytes = st.session_state.get("review_final_video_bytes")
         review_final_filename = st.session_state.get("review_final_filename")
 
         if review_items:
             st.divider()
             st.markdown(
-                f"**Review progress:** {len(review_results)} approved / {len(review_items)} total stories."
+                f"**Progress:** {len(review_results)} generated, {len(review_skipped_titles)} skipped, {review_current_index} processed, {len(review_items)} total stories."
             )
+
+            control_col1, control_col2 = st.columns(2)
+            with control_col1:
+                if st.button("Resume / Continue auto flow"):
+                    st.session_state["review_auto_run"] = True
+                    append_log("Auto flow resumed by user.")
+                    st.rerun()
+            with control_col2:
+                if st.button("Stop after current clip"):
+                    st.session_state["review_auto_run"] = False
+                    append_log("Auto flow stopped by user.")
+                    st.rerun()
 
             if review_current_index < len(review_items):
                 current_story = review_items[review_current_index]
-                st.info(
-                    f"Current story for review: {review_current_index + 1} / {len(review_items)} — {current_story.title}"
-                )
-
-                if review_pending_result is None:
-                    if st.button(
-                        f"Generate clip for story {review_current_index + 1}",
-                        key=f"generate-story-{review_current_index}",
-                    ):
-                        if not gemini_api_key:
-                            st.error("Please enter your Gemini API key.")
-                        elif not searchapi_key:
-                            st.error("Please enter your SearchApi.io key.")
+                if review_auto_run:
+                    st.info(
+                        f"Auto-processing story {review_current_index + 1} / {len(review_items)} — {current_story.title}"
+                    )
+                    if not gemini_api_key:
+                        st.error("Please enter your Gemini API key.")
+                        st.session_state["review_auto_run"] = False
+                    elif not searchapi_key:
+                        st.error("Please enter your SearchApi.io key.")
+                        st.session_state["review_auto_run"] = False
+                    else:
+                        status_placeholder = st.empty()
+                        try:
+                            append_log(f"JSON auto flow: generating story {review_current_index + 1}.")
+                            result = process_single_story_item(
+                                item=current_story,
+                                story_index=review_current_index + 1,
+                                gemini_api_key=gemini_api_key,
+                                searchapi_key=searchapi_key,
+                                validation_model=st.session_state["review_validation_model"],
+                                image_model=st.session_state["review_image_model"],
+                                audio_model=st.session_state["review_audio_model"],
+                                voice_name=st.session_state["review_voice_name"],
+                                video_format=st.session_state["review_video_format"],
+                                status_placeholder=status_placeholder,
+                            )
+                        except Exception as exc:
+                            append_log(f"Skipping story {review_current_index + 1} due to error: {exc}")
+                            status_placeholder.warning(
+                                f"Skipping story {review_current_index + 1}: {current_story.title}"
+                            )
+                            st.session_state["review_skipped_titles"] = [
+                                *review_skipped_titles,
+                                current_story.title,
+                            ]
                         else:
-                            status_placeholder = st.empty()
-                            try:
-                                append_log(f"JSON review flow: generating story {review_current_index + 1}.")
-                                result = process_single_story_item(
-                                    item=current_story,
-                                    story_index=review_current_index + 1,
-                                    gemini_api_key=gemini_api_key,
-                                    searchapi_key=searchapi_key,
-                                    validation_model=st.session_state["review_validation_model"],
-                                    image_model=st.session_state["review_image_model"],
-                                    audio_model=st.session_state["review_audio_model"],
-                                    voice_name=st.session_state["review_voice_name"],
-                                    video_format=st.session_state["review_video_format"],
-                                    status_placeholder=status_placeholder,
-                                )
-                            except Exception as exc:
-                                append_log(f"Error while generating story {review_current_index + 1}: {exc}")
-                                status_placeholder.error(str(exc))
-                            else:
-                                st.session_state["review_pending_result"] = result
-                                st.session_state["review_preview_open"] = False
-                                append_log(f"Story {review_current_index + 1} clip generated and awaiting preview.")
-                                st.rerun()
+                            st.session_state["review_results"] = [*review_results, result]
+                            st.session_state["review_last_result"] = result
+                            append_log(
+                                f"Story {review_current_index + 1} generated successfully and auto-approved."
+                            )
+
+                        st.session_state["review_current_index"] = review_current_index + 1
+                        st.rerun()
                 else:
-                    st.success(
-                        "Clip generated. Use the preview button below to review the downloaded image, Gemini overlay image, audio, and clip before continuing."
+                    st.info(
+                        f"Auto flow is paused at story {review_current_index + 1} / {len(review_items)} — {current_story.title}"
                     )
                     if st.button(
-                        "Preview generated clip",
-                        key=f"preview-generated-{review_current_index}",
+                        f"Generate next clip now ({review_current_index + 1})",
+                        key=f"generate-story-{review_current_index}",
                     ):
-                        st.session_state["review_preview_open"] = True
-                        append_log(f"Opened preview for story {review_current_index + 1}.")
+                        st.session_state["review_auto_run"] = True
+                        append_log("User requested immediate continuation of the auto flow.")
                         st.rerun()
-
-                    if review_preview_open:
-                        render_story_result_preview(review_pending_result, review_current_index + 1)
-                        action_col1, action_col2 = st.columns(2)
-                        with action_col1:
-                            if st.button(
-                                "Approve preview and continue to next story",
-                                key=f"approve-story-{review_current_index}",
-                            ):
-                                updated_results = [*review_results, review_pending_result]
-                                st.session_state["review_results"] = updated_results
-                                st.session_state["review_pending_result"] = None
-                                st.session_state["review_preview_open"] = False
-                                st.session_state["review_current_index"] = review_current_index + 1
-                                append_log(f"Approved story {review_current_index + 1} and moved to next story.")
-                                st.rerun()
-                        with action_col2:
-                            if st.button(
-                                "Regenerate current clip",
-                                key=f"regenerate-story-{review_current_index}",
-                            ):
-                                st.session_state["review_pending_result"] = None
-                                st.session_state["review_preview_open"] = False
-                                append_log(f"User requested regeneration for story {review_current_index + 1}.")
-                                st.rerun()
             else:
-                st.success("All individual clips have been reviewed.")
+                st.success("All stories have been processed.")
                 if review_final_video_bytes is None:
-                    if st.button("Build combined reviewed video"):
+                    if review_results:
                         with st.spinner("Combining approved clips into the final video..."):
                             final_video_bytes, final_filename = combine_story_results(
                                 review_results,
@@ -1021,8 +1020,11 @@ def render_app() -> None:
                             )
                         st.session_state["review_final_video_bytes"] = final_video_bytes
                         st.session_state["review_final_filename"] = final_filename
+                        st.session_state["review_auto_run"] = False
                         append_log("Combined reviewed video is ready for download.")
                         st.rerun()
+                    else:
+                        st.warning("No clips were generated successfully, so there is no combined video.")
                 else:
                     st.success("Combined video is ready.")
                     combined_mime = (
@@ -1038,10 +1040,19 @@ def render_app() -> None:
                         mime=combined_mime,
                     )
 
+            if review_skipped_titles:
+                st.markdown("### Skipped stories")
+                for skipped_title in review_skipped_titles:
+                    st.caption(f"Skipped: {skipped_title}")
+
+            if review_last_result is not None:
+                st.markdown("### Latest generated clip preview")
+                render_story_result_preview(review_last_result, len(review_results))
+
             if review_results:
-                st.markdown("### Approved clips")
+                st.markdown("### Generated clips")
                 for index, result in enumerate(review_results, start=1):
-                    with st.expander(f"Approved story {index}: {result.item.title}", expanded=False):
+                    with st.expander(f"Generated story {index}: {result.item.title}", expanded=False):
                         render_story_result_preview(result, index)
 
 
