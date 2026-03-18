@@ -1,10 +1,12 @@
 import io
 import json
+import logging
 import mimetypes
 import struct
 import tempfile
 import textwrap
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +26,10 @@ DEFAULT_VOICE = "Zephyr"
 VIDEO_SIZE = (1280, 720)
 MIN_IMAGE_DIMENSION = 1280
 IMAGE_SEARCH_RESULT_LIMIT = 10
+MAX_LOG_LINES = 500
+
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger("gemini_media_studio")
 
 SAMPLE_JSON = json.dumps(
     [
@@ -79,6 +85,28 @@ class StoryResult:
 
 
 
+def append_log(message: str) -> None:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    log_line = f"[{timestamp}] {message}"
+    LOGGER.info(log_line)
+    try:
+        logs = st.session_state.setdefault("app_logs", [])
+        logs.append(log_line)
+        if len(logs) > MAX_LOG_LINES:
+            del logs[:-MAX_LOG_LINES]
+    except Exception:
+        pass
+
+
+def clear_logs() -> None:
+    st.session_state["app_logs"] = []
+
+
+def get_logs_text() -> str:
+    return "\n".join(st.session_state.get("app_logs", []))
+
+
+
 def get_gemini_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
@@ -90,6 +118,7 @@ def generate_image(
     mime_type: str,
     model: str,
 ) -> tuple[Optional[bytes], str]:
+    append_log(f"Starting Gemini image generation with model={model}.")
     client = get_gemini_client(api_key)
     contents = [
         types.Content(
@@ -117,6 +146,7 @@ def generate_image(
         elif chunk.text:
             text_chunks.append(chunk.text)
 
+    append_log("Finished Gemini image generation." f" image_returned={'yes' if output_image_bytes else 'no'}")
     return output_image_bytes, "".join(text_chunks).strip()
 
 
@@ -176,6 +206,7 @@ def generate_audio(
     voice_name: str,
     model: str,
 ) -> tuple[Optional[bytes], Optional[str], str]:
+    append_log(f"Starting Gemini audio generation with model={model}, voice={voice_name}.")
     client = get_gemini_client(api_key)
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=script_text)])]
     config = types.GenerateContentConfig(
@@ -208,6 +239,7 @@ def generate_audio(
         elif chunk.text:
             text_chunks.append(chunk.text)
 
+    append_log("Finished Gemini audio generation." f" audio_returned={'yes' if audio_bytes else 'no'}")
     return audio_bytes, audio_mime_type, "".join(text_chunks).strip()
 
 
@@ -237,6 +269,7 @@ def parse_json_items(raw_json: str) -> list[NewsItem]:
 
 
 def search_images(searchapi_key: str, query: str) -> list[dict[str, Any]]:
+    append_log(f"Searching SearchApi images for query: {query}")
     params = {
         "engine": "google_images",
         "q": query,
@@ -248,7 +281,9 @@ def search_images(searchapi_key: str, query: str) -> list[dict[str, Any]]:
     payload = response.json()
     images = payload.get("images", [])
     if not isinstance(images, list):
+        append_log("SearchApi response did not include a list of images.")
         return []
+    append_log(f"SearchApi returned {len(images)} image candidates.")
     return images
 
 
@@ -295,6 +330,7 @@ def validate_downloaded_image(
     image_bytes: bytes,
     mime_type: str,
 ) -> tuple[bool, str]:
+    append_log(f"Running Gemini image validation with model={validation_model} for title={title}")
     client = get_gemini_client(api_key)
     prompt = textwrap.dedent(
         f"""
@@ -324,11 +360,14 @@ def validate_downloaded_image(
     lowered = response_text.lower()
     is_match = lowered.startswith("match: yes")
     if not response_text:
+        append_log("Validation model returned empty text; accepting image.")
         return True, "Validation model returned an empty response, so the image was accepted."
+    append_log(f"Validation result: {response_text}")
     return is_match, response_text
 
 
 def try_download_candidate(candidate: dict[str, Any]) -> tuple[bytes, str, int, int]:
+    append_log("Downloading candidate image " f"url={candidate['image_url']} declared_size={candidate['width']}x{candidate['height']}")
     response = requests.get(
         candidate["image_url"],
         timeout=30,
@@ -339,6 +378,7 @@ def try_download_candidate(candidate: dict[str, Any]) -> tuple[bytes, str, int, 
     normalized_bytes, normalized_mime, actual_width, actual_height = normalize_image_bytes(
         response.content
     )
+    append_log("Downloaded candidate image successfully " f"actual_size={actual_width}x{actual_height}")
     return normalized_bytes, normalized_mime or mime_type, actual_width, actual_height
 
 
@@ -352,12 +392,14 @@ def download_best_image(
     results = search_images(searchapi_key, query)
     candidates = extract_image_candidates(results)
     candidate_errors: list[str] = []
+    append_log(f"Evaluating {len(candidates)} downloaded image candidates.")
     fallback_image: Optional[DownloadedImage] = None
 
     for candidate in candidates:
         try:
             normalized_bytes, mime_type, actual_width, actual_height = try_download_candidate(candidate)
         except Exception as exc:
+            append_log(f"Candidate download failed: {candidate['image_url']} :: {exc}")
             candidate_errors.append(f"{candidate['image_url']}: {exc}")
             continue
 
@@ -372,6 +414,7 @@ def download_best_image(
                 mime_type=mime_type,
             )
         except Exception as exc:
+            append_log(f"Validation failed unexpectedly; accepting image. Error: {exc}")
             validation_summary = (
                 "Validation check failed, so the image was accepted without automated verification: "
                 f"{exc}"
@@ -390,9 +433,11 @@ def download_best_image(
         )
 
         if is_high_res and is_match:
+            append_log("Selected high-resolution validated image candidate.")
             return downloaded_image
 
         if fallback_image is None and is_match:
+            append_log("Stored a lower-priority fallback image candidate.")
             fallback_note = (
                 "Fallback image used because no downloadable image above 1280 pixels passed the checks. "
                 f"Validation: {validation_summary}"
@@ -409,17 +454,20 @@ def download_best_image(
             )
 
         if not is_match:
+            append_log("Rejected candidate because validation reported it as a mismatch.")
             candidate_errors.append(
                 f"{candidate['image_url']}: rejected by validation check ({validation_summary})"
             )
 
     if fallback_image is not None:
+        append_log("Using fallback image candidate because no 1280+ validated image was available.")
         return fallback_image
 
     for candidate in candidates:
         try:
             normalized_bytes, mime_type, actual_width, actual_height = try_download_candidate(candidate)
         except Exception as exc:
+            append_log(f"Candidate download failed: {candidate['image_url']} :: {exc}")
             candidate_errors.append(f"{candidate['image_url']}: {exc}")
             continue
 
@@ -437,6 +485,7 @@ def download_best_image(
         )
 
     details = "\n".join(candidate_errors[:5])
+    append_log("No downloadable image candidate could be used.")
     raise ValueError(
         "No downloadable image with a dimension over 1280 pixels was found for the search keywords."
         + (f"\n{details}" if details else "")
@@ -559,6 +608,7 @@ def process_single_story_item(
 ) -> StoryResult:
     with tempfile.TemporaryDirectory() as workspace_dir:
         workspace = Path(workspace_dir)
+        append_log(f"Starting clip generation for story {story_index}: {item.title}")
         status_placeholder.info(f"Searching and downloading image for: {item.title}")
         source_image = download_best_image(
             searchapi_key=searchapi_key,
@@ -603,6 +653,7 @@ def process_single_story_item(
             output_path=clip_path,
         )
 
+        append_log(f"Finished clip generation for story {story_index}: {item.title}")
         status_placeholder.success(f"Clip ready for review: {item.title}")
         return StoryResult(
             item=item,
@@ -618,6 +669,7 @@ def process_single_story_item(
 
 
 def combine_story_results(results: list[StoryResult], video_format: str) -> tuple[bytes, str]:
+    append_log(f"Combining {len(results)} approved clips into a final {video_format} video.")
     with tempfile.TemporaryDirectory() as workspace_dir:
         workspace = Path(workspace_dir)
         clip_paths: list[Path] = []
@@ -629,6 +681,7 @@ def combine_story_results(results: list[StoryResult], video_format: str) -> tupl
         final_filename = f"combined_news_reel.{video_format}"
         final_path = workspace / final_filename
         concatenate_story_videos(clip_paths, video_format, final_path)
+        append_log(f"Finished building combined video: {final_filename}")
         return final_path.read_bytes(), final_filename
 
 
@@ -730,6 +783,12 @@ def render_app() -> None:
         audio_model = st.text_input("Audio Model", value=DEFAULT_AUDIO_MODEL)
         validation_model = st.text_input("Validation Model", value=DEFAULT_VALIDATION_MODEL)
         voice_name = st.text_input("Voice Name", value=DEFAULT_VOICE)
+        if st.button("Clear logs"):
+            clear_logs()
+
+    with st.expander("Debug logs", expanded=False):
+        logs_text = get_logs_text()
+        st.code(logs_text or "No logs yet.", language="text")
 
     if mode == "Image":
         st.subheader("Reference Image + Prompt → Generated Image")
@@ -754,6 +813,7 @@ def render_app() -> None:
                 guessed_mime = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0]
                 mime_type = guessed_mime or "image/jpeg"
                 with st.spinner("Generating image..."):
+                    append_log("Image mode: user requested image generation.")
                     generated_image_bytes, generated_text = generate_image(
                         api_key=gemini_api_key,
                         prompt=prompt.strip(),
@@ -786,6 +846,7 @@ def render_app() -> None:
                 st.error("Please enter a script for speech generation.")
             else:
                 with st.spinner("Generating audio..."):
+                    append_log("Audio mode: user requested audio generation.")
                     audio_bytes, audio_mime_type, generated_text = generate_audio(
                         api_key=gemini_api_key,
                         script_text=script_text.strip(),
@@ -824,6 +885,7 @@ def render_app() -> None:
                 try:
                     preview_items = parse_json_items(json_source)
                 except Exception as exc:
+                    append_log(f"JSON preview/start error: {exc}")
                     st.error(str(exc))
                 else:
                     st.success(f"Loaded {len(preview_items)} JSON items.")
@@ -843,6 +905,7 @@ def render_app() -> None:
                 try:
                     items = parse_json_items(json_source)
                 except Exception as exc:
+                    append_log(f"JSON review flow start error: {exc}")
                     st.error(str(exc))
                 else:
                     reset_review_state(
@@ -856,6 +919,7 @@ def render_app() -> None:
                     st.success(
                         "Review flow started. Generate one clip, preview it, then continue to the next story."
                     )
+                    append_log(f"Started reviewed clip flow for {len(items)} stories.")
 
         review_items = st.session_state.get("review_items", [])
         review_results: list[StoryResult] = st.session_state.get("review_results", [])
@@ -889,6 +953,7 @@ def render_app() -> None:
                         else:
                             status_placeholder = st.empty()
                             try:
+                                append_log(f"JSON review flow: generating story {review_current_index + 1}.")
                                 result = process_single_story_item(
                                     item=current_story,
                                     story_index=review_current_index + 1,
@@ -902,10 +967,12 @@ def render_app() -> None:
                                     status_placeholder=status_placeholder,
                                 )
                             except Exception as exc:
+                                append_log(f"Error while generating story {review_current_index + 1}: {exc}")
                                 status_placeholder.error(str(exc))
                             else:
                                 st.session_state["review_pending_result"] = result
                                 st.session_state["review_preview_open"] = False
+                                append_log(f"Story {review_current_index + 1} clip generated and awaiting preview.")
                                 st.rerun()
                 else:
                     st.success(
@@ -916,6 +983,7 @@ def render_app() -> None:
                         key=f"preview-generated-{review_current_index}",
                     ):
                         st.session_state["review_preview_open"] = True
+                        append_log(f"Opened preview for story {review_current_index + 1}.")
                         st.rerun()
 
                     if review_preview_open:
@@ -931,6 +999,7 @@ def render_app() -> None:
                                 st.session_state["review_pending_result"] = None
                                 st.session_state["review_preview_open"] = False
                                 st.session_state["review_current_index"] = review_current_index + 1
+                                append_log(f"Approved story {review_current_index + 1} and moved to next story.")
                                 st.rerun()
                         with action_col2:
                             if st.button(
@@ -939,6 +1008,7 @@ def render_app() -> None:
                             ):
                                 st.session_state["review_pending_result"] = None
                                 st.session_state["review_preview_open"] = False
+                                append_log(f"User requested regeneration for story {review_current_index + 1}.")
                                 st.rerun()
             else:
                 st.success("All individual clips have been reviewed.")
@@ -951,6 +1021,7 @@ def render_app() -> None:
                             )
                         st.session_state["review_final_video_bytes"] = final_video_bytes
                         st.session_state["review_final_filename"] = final_filename
+                        append_log("Combined reviewed video is ready for download.")
                         st.rerun()
                 else:
                     st.success("Combined video is ready.")
