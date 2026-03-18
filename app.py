@@ -545,8 +545,9 @@ def concatenate_story_videos(video_paths: list[Path], video_format: str, output_
             clip.close()
 
 
-def process_story_items(
-    items: list[NewsItem],
+def process_single_story_item(
+    item: NewsItem,
+    story_index: int,
     gemini_api_key: str,
     searchapi_key: str,
     validation_model: str,
@@ -555,89 +556,162 @@ def process_story_items(
     voice_name: str,
     video_format: str,
     status_placeholder: Any,
-    progress_bar: Any,
-) -> tuple[list[StoryResult], bytes, str]:
-    results: list[StoryResult] = []
-    generated_clip_paths: list[Path] = []
-
+) -> StoryResult:
     with tempfile.TemporaryDirectory() as workspace_dir:
         workspace = Path(workspace_dir)
-        total_steps = max(len(items) * 4 + 1, 1)
-        completed_steps = 0
+        status_placeholder.info(f"Searching and downloading image for: {item.title}")
+        source_image = download_best_image(
+            searchapi_key=searchapi_key,
+            gemini_api_key=gemini_api_key,
+            validation_model=validation_model,
+            title=item.title,
+            query=item.image_search_keywords,
+        )
 
-        def advance(message: str) -> None:
-            nonlocal completed_steps
-            completed_steps += 1
-            progress_bar.progress(min(completed_steps / total_steps, 1.0), text=message)
-            status_placeholder.info(message)
+        status_placeholder.info(
+            f"Generating Gemini image overlay with the story title for: {item.title}"
+        )
+        generated_image_bytes, generated_text = generate_image(
+            api_key=gemini_api_key,
+            prompt=build_overlay_prompt(item.title),
+            image_bytes=source_image.data,
+            mime_type=source_image.mime_type,
+            model=image_model,
+        )
+        if not generated_image_bytes:
+            raise ValueError(f"Gemini did not return an image for story {story_index}: {item.title}")
+        generated_image_bytes, _, _, _ = normalize_image_bytes(generated_image_bytes)
 
-        for index, item in enumerate(items, start=1):
-            advance(f"[{index}/{len(items)}] Searching and downloading image for: {item.title}")
-            source_image = download_best_image(
-                searchapi_key=searchapi_key,
-                gemini_api_key=gemini_api_key,
-                validation_model=validation_model,
-                title=item.title,
-                query=item.image_search_keywords,
-            )
+        status_placeholder.info(f"Generating Telugu TTS audio for: {item.title}")
+        generated_audio_bytes, generated_audio_mime, tts_text = generate_audio(
+            api_key=gemini_api_key,
+            script_text=item.summary,
+            voice_name=voice_name,
+            model=audio_model,
+        )
+        if not generated_audio_bytes:
+            raise ValueError(f"Gemini did not return audio for story {story_index}: {item.title}")
 
-            advance(f"[{index}/{len(items)}] Generating Gemini overlay image for: {item.title}")
-            generated_image_bytes, generated_text = generate_image(
-                api_key=gemini_api_key,
-                prompt=build_overlay_prompt(item.title),
-                image_bytes=source_image.data,
-                mime_type=source_image.mime_type,
-                model=image_model,
-            )
-            if not generated_image_bytes:
-                raise ValueError(f"Gemini did not return an image for item {index}: {item.title}")
-            generated_image_bytes, _, _, _ = normalize_image_bytes(generated_image_bytes)
+        status_placeholder.info(f"Rendering video clip for: {item.title}")
+        clip_filename = f"story_{story_index:02d}.{video_format}"
+        clip_path = workspace / clip_filename
+        create_video_from_image_and_audio(
+            image_bytes=generated_image_bytes,
+            audio_bytes=generated_audio_bytes,
+            audio_mime_type=generated_audio_mime or "audio/wav",
+            video_format=video_format,
+            output_path=clip_path,
+        )
 
-            advance(f"[{index}/{len(items)}] Generating Telugu TTS audio for: {item.title}")
-            generated_audio_bytes, generated_audio_mime, tts_text = generate_audio(
-                api_key=gemini_api_key,
-                script_text=item.summary,
-                voice_name=voice_name,
-                model=audio_model,
-            )
-            if not generated_audio_bytes:
-                raise ValueError(f"Gemini did not return audio for item {index}: {item.title}")
+        status_placeholder.success(f"Clip ready for review: {item.title}")
+        return StoryResult(
+            item=item,
+            source_image=source_image,
+            generated_image_bytes=generated_image_bytes,
+            generated_audio_bytes=generated_audio_bytes,
+            generated_audio_mime=generated_audio_mime or "audio/wav",
+            clip_bytes=clip_path.read_bytes(),
+            clip_filename=clip_filename,
+            generated_text=generated_text,
+            tts_text=tts_text,
+        )
 
-            advance(f"[{index}/{len(items)}] Rendering video clip for: {item.title}")
-            clip_filename = f"story_{index:02d}.{video_format}"
-            clip_path = workspace / clip_filename
-            create_video_from_image_and_audio(
-                image_bytes=generated_image_bytes,
-                audio_bytes=generated_audio_bytes,
-                audio_mime_type=generated_audio_mime or "audio/wav",
-                video_format=video_format,
-                output_path=clip_path,
-            )
-            generated_clip_paths.append(clip_path)
 
-            results.append(
-                StoryResult(
-                    item=item,
-                    source_image=source_image,
-                    generated_image_bytes=generated_image_bytes,
-                    generated_audio_bytes=generated_audio_bytes,
-                    generated_audio_mime=generated_audio_mime or "audio/wav",
-                    clip_bytes=clip_path.read_bytes(),
-                    clip_filename=clip_filename,
-                    generated_text=generated_text,
-                    tts_text=tts_text,
-                )
-            )
+def combine_story_results(results: list[StoryResult], video_format: str) -> tuple[bytes, str]:
+    with tempfile.TemporaryDirectory() as workspace_dir:
+        workspace = Path(workspace_dir)
+        clip_paths: list[Path] = []
+        for index, result in enumerate(results, start=1):
+            clip_path = workspace / f"story_{index:02d}.{video_format}"
+            clip_path.write_bytes(result.clip_bytes)
+            clip_paths.append(clip_path)
 
-        advance("Combining all clips into one final video")
         final_filename = f"combined_news_reel.{video_format}"
         final_path = workspace / final_filename
-        concatenate_story_videos(generated_clip_paths, video_format, final_path)
-        final_video_bytes = final_path.read_bytes()
+        concatenate_story_videos(clip_paths, video_format, final_path)
+        return final_path.read_bytes(), final_filename
 
-    progress_bar.progress(1.0, text="Done")
-    status_placeholder.success("Processing completed successfully.")
-    return results, final_video_bytes, final_filename
+
+def render_story_result_preview(result: StoryResult, index: int) -> None:
+    st.markdown(f"**Story {index}: {result.item.title}**")
+    st.markdown(f"**Article URL:** {result.item.article_url}")
+    st.markdown(
+        f"**Downloaded source image:** {result.source_image.width}×{result.source_image.height}"
+    )
+    st.caption(f"Search result source page: {result.source_image.source_page}")
+    st.caption(f"Original downloaded image URL: {result.source_image.source_url}")
+    st.caption(f"Image validation: {result.source_image.validation_summary}")
+    if result.source_image.used_fallback:
+        st.warning("Fallback image was used for this story.")
+    st.caption(
+        "Gemini image overlay prompt uses the story title so the title is added to the generated image."
+    )
+    st.image(
+        result.source_image.data,
+        caption="Downloaded source image from SearchApi result",
+        use_container_width=True,
+    )
+    st.image(
+        result.generated_image_bytes,
+        caption="Gemini-generated overlay image using the story title",
+        use_container_width=True,
+    )
+    st.audio(
+        result.generated_audio_bytes,
+        format=result.generated_audio_mime,
+    )
+    st.video(result.clip_bytes)
+    clip_mime = "video/mp4" if result.clip_filename.endswith(".mp4") else "video/webm"
+    st.download_button(
+        f"Download clip {index}",
+        data=result.clip_bytes,
+        file_name=result.clip_filename,
+        mime=clip_mime,
+        key=f"clip-download-{index}",
+    )
+    st.download_button(
+        f"Download image {index}",
+        data=result.generated_image_bytes,
+        file_name=f"story_{index:02d}.jpg",
+        mime="image/jpeg",
+        key=f"image-download-{index}",
+    )
+    audio_ext = mimetypes.guess_extension(result.generated_audio_mime) or ".wav"
+    st.download_button(
+        f"Download audio {index}",
+        data=result.generated_audio_bytes,
+        file_name=f"story_{index:02d}{audio_ext}",
+        mime=result.generated_audio_mime,
+        key=f"audio-download-{index}",
+    )
+    if result.generated_text:
+        st.markdown("**Gemini image response text:**")
+        st.write(result.generated_text)
+    if result.tts_text:
+        st.markdown("**Gemini TTS response text:**")
+        st.write(result.tts_text)
+
+
+def reset_review_state(
+    items: list[NewsItem],
+    video_format: str,
+    image_model: str,
+    audio_model: str,
+    validation_model: str,
+    voice_name: str,
+) -> None:
+    st.session_state["review_items"] = items
+    st.session_state["review_video_format"] = video_format
+    st.session_state["review_image_model"] = image_model
+    st.session_state["review_audio_model"] = audio_model
+    st.session_state["review_validation_model"] = validation_model
+    st.session_state["review_voice_name"] = voice_name
+    st.session_state["review_current_index"] = 0
+    st.session_state["review_results"] = []
+    st.session_state["review_pending_result"] = None
+    st.session_state["review_preview_open"] = False
+    st.session_state["review_final_video_bytes"] = None
+    st.session_state["review_final_filename"] = None
 
 
 def render_app() -> None:
@@ -758,9 +832,9 @@ def render_app() -> None:
                         st.write(item.summary)
                         st.caption(item.article_url)
         with col2:
-            run_pipeline = st.button("Generate videos from JSON", type="primary")
+            start_review = st.button("Start / Reset reviewed clip flow", type="primary")
 
-        if run_pipeline:
+        if start_review:
             if not gemini_api_key:
                 st.error("Please enter your Gemini API key.")
             elif not searchapi_key:
@@ -771,88 +845,133 @@ def render_app() -> None:
                 except Exception as exc:
                     st.error(str(exc))
                 else:
-                    status_placeholder = st.empty()
-                    progress_bar = st.progress(0.0, text="Starting...")
-                    try:
-                        results, final_video_bytes, final_filename = process_story_items(
-                            items=items,
-                            gemini_api_key=gemini_api_key,
-                            searchapi_key=searchapi_key,
-                            validation_model=validation_model.strip() or DEFAULT_VALIDATION_MODEL,
-                            image_model=image_model.strip(),
-                            audio_model=audio_model.strip(),
-                            voice_name=voice_name.strip() or DEFAULT_VOICE,
-                            video_format=video_format,
-                            status_placeholder=status_placeholder,
-                            progress_bar=progress_bar,
-                        )
-                    except Exception as exc:
-                        status_placeholder.error(str(exc))
-                    else:
-                        st.success(
-                            f"Built {len(results)} individual story videos and one combined {video_format.upper()} reel."
-                        )
-                        st.download_button(
-                            "Download combined video",
-                            data=final_video_bytes,
-                            file_name=final_filename,
-                            mime="video/mp4" if video_format == "mp4" else "video/webm",
-                        )
-                        for index, result in enumerate(results, start=1):
-                            with st.expander(f"Story {index}: {result.item.title}", expanded=index == 1):
-                                st.markdown(f"**Article URL:** {result.item.article_url}")
-                                st.markdown(
-                                    f"**Downloaded source image:** {result.source_image.width}×{result.source_image.height}"
+                    reset_review_state(
+                        items=items,
+                        video_format=video_format,
+                        image_model=image_model.strip(),
+                        audio_model=audio_model.strip(),
+                        validation_model=validation_model.strip() or DEFAULT_VALIDATION_MODEL,
+                        voice_name=voice_name.strip() or DEFAULT_VOICE,
+                    )
+                    st.success(
+                        "Review flow started. Generate one clip, preview it, then continue to the next story."
+                    )
+
+        review_items = st.session_state.get("review_items", [])
+        review_results: list[StoryResult] = st.session_state.get("review_results", [])
+        review_pending_result: Optional[StoryResult] = st.session_state.get("review_pending_result")
+        review_current_index = st.session_state.get("review_current_index", 0)
+        review_preview_open = st.session_state.get("review_preview_open", False)
+        review_final_video_bytes = st.session_state.get("review_final_video_bytes")
+        review_final_filename = st.session_state.get("review_final_filename")
+
+        if review_items:
+            st.divider()
+            st.markdown(
+                f"**Review progress:** {len(review_results)} approved / {len(review_items)} total stories."
+            )
+
+            if review_current_index < len(review_items):
+                current_story = review_items[review_current_index]
+                st.info(
+                    f"Current story for review: {review_current_index + 1} / {len(review_items)} — {current_story.title}"
+                )
+
+                if review_pending_result is None:
+                    if st.button(
+                        f"Generate clip for story {review_current_index + 1}",
+                        key=f"generate-story-{review_current_index}",
+                    ):
+                        if not gemini_api_key:
+                            st.error("Please enter your Gemini API key.")
+                        elif not searchapi_key:
+                            st.error("Please enter your SearchApi.io key.")
+                        else:
+                            status_placeholder = st.empty()
+                            try:
+                                result = process_single_story_item(
+                                    item=current_story,
+                                    story_index=review_current_index + 1,
+                                    gemini_api_key=gemini_api_key,
+                                    searchapi_key=searchapi_key,
+                                    validation_model=st.session_state["review_validation_model"],
+                                    image_model=st.session_state["review_image_model"],
+                                    audio_model=st.session_state["review_audio_model"],
+                                    voice_name=st.session_state["review_voice_name"],
+                                    video_format=st.session_state["review_video_format"],
+                                    status_placeholder=status_placeholder,
                                 )
-                                if result.source_image.used_fallback:
-                                    st.warning("Fallback image was used for this story.")
-                                st.caption(f"Search result source page: {result.source_image.source_page}")
-                                st.caption(f"Original downloaded image URL: {result.source_image.source_url}")
-                                st.caption(f"Image validation: {result.source_image.validation_summary}")
-                                st.image(
-                                    result.source_image.data,
-                                    caption="Downloaded source image from SearchApi result",
-                                    use_container_width=True,
-                                )
-                                st.image(
-                                    result.generated_image_bytes,
-                                    caption="Gemini-generated overlay image",
-                                    use_container_width=True,
-                                )
-                                st.audio(
-                                    result.generated_audio_bytes,
-                                    format=result.generated_audio_mime,
-                                )
-                                st.video(result.clip_bytes)
-                                clip_mime = "video/mp4" if result.clip_filename.endswith(".mp4") else "video/webm"
-                                st.download_button(
-                                    f"Download clip {index}",
-                                    data=result.clip_bytes,
-                                    file_name=result.clip_filename,
-                                    mime=clip_mime,
-                                    key=f"clip-download-{index}",
-                                )
-                                st.download_button(
-                                    f"Download image {index}",
-                                    data=result.generated_image_bytes,
-                                    file_name=f"story_{index:02d}.jpg",
-                                    mime="image/jpeg",
-                                    key=f"image-download-{index}",
-                                )
-                                audio_ext = mimetypes.guess_extension(result.generated_audio_mime) or ".wav"
-                                st.download_button(
-                                    f"Download audio {index}",
-                                    data=result.generated_audio_bytes,
-                                    file_name=f"story_{index:02d}{audio_ext}",
-                                    mime=result.generated_audio_mime,
-                                    key=f"audio-download-{index}",
-                                )
-                                if result.generated_text:
-                                    st.markdown("**Gemini image response text:**")
-                                    st.write(result.generated_text)
-                                if result.tts_text:
-                                    st.markdown("**Gemini TTS response text:**")
-                                    st.write(result.tts_text)
+                            except Exception as exc:
+                                status_placeholder.error(str(exc))
+                            else:
+                                st.session_state["review_pending_result"] = result
+                                st.session_state["review_preview_open"] = False
+                                st.rerun()
+                else:
+                    st.success(
+                        "Clip generated. Use the preview button below to review the downloaded image, Gemini overlay image, audio, and clip before continuing."
+                    )
+                    if st.button(
+                        "Preview generated clip",
+                        key=f"preview-generated-{review_current_index}",
+                    ):
+                        st.session_state["review_preview_open"] = True
+                        st.rerun()
+
+                    if review_preview_open:
+                        render_story_result_preview(review_pending_result, review_current_index + 1)
+                        action_col1, action_col2 = st.columns(2)
+                        with action_col1:
+                            if st.button(
+                                "Approve preview and continue to next story",
+                                key=f"approve-story-{review_current_index}",
+                            ):
+                                updated_results = [*review_results, review_pending_result]
+                                st.session_state["review_results"] = updated_results
+                                st.session_state["review_pending_result"] = None
+                                st.session_state["review_preview_open"] = False
+                                st.session_state["review_current_index"] = review_current_index + 1
+                                st.rerun()
+                        with action_col2:
+                            if st.button(
+                                "Regenerate current clip",
+                                key=f"regenerate-story-{review_current_index}",
+                            ):
+                                st.session_state["review_pending_result"] = None
+                                st.session_state["review_preview_open"] = False
+                                st.rerun()
+            else:
+                st.success("All individual clips have been reviewed.")
+                if review_final_video_bytes is None:
+                    if st.button("Build combined reviewed video"):
+                        with st.spinner("Combining approved clips into the final video..."):
+                            final_video_bytes, final_filename = combine_story_results(
+                                review_results,
+                                st.session_state["review_video_format"],
+                            )
+                        st.session_state["review_final_video_bytes"] = final_video_bytes
+                        st.session_state["review_final_filename"] = final_filename
+                        st.rerun()
+                else:
+                    st.success("Combined video is ready.")
+                    combined_mime = (
+                        "video/mp4"
+                        if str(review_final_filename).endswith(".mp4")
+                        else "video/webm"
+                    )
+                    st.video(review_final_video_bytes)
+                    st.download_button(
+                        "Download combined video",
+                        data=review_final_video_bytes,
+                        file_name=review_final_filename,
+                        mime=combined_mime,
+                    )
+
+            if review_results:
+                st.markdown("### Approved clips")
+                for index, result in enumerate(review_results, start=1):
+                    with st.expander(f"Approved story {index}: {result.item.title}", expanded=False):
+                        render_story_result_preview(result, index)
 
 
 if __name__ == "__main__":

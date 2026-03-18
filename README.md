@@ -15,7 +15,8 @@ Python Streamlit app for Gemini-powered media workflows.
   - send the downloaded image to Gemini image generation with the story `title` as the overlay prompt
   - convert each Telugu `summary` into speech audio using Gemini TTS
   - create one video per story from the generated image + audio
-  - combine all story clips into a final MP4 or WebM reel
+  - preview/review each generated clip in the UI before continuing to the next story
+  - combine all approved story clips into a final MP4 or WebM reel
 
 ## Expected JSON shape
 
