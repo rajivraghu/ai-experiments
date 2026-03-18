@@ -8,8 +8,10 @@ Python Streamlit app for Gemini-powered media workflows.
 - **Audio mode**: enter a script and generate speech audio with Gemini TTS.
 - **JSON Video Builder**:
   - paste or upload a JSON array of news/story objects
-  - search and download high-resolution images from SearchApi.io using `image_search_keywords`
-  - require downloaded images to have a dimension above 1280 pixels
+  - search and download images from SearchApi.io using `image_search_keywords`
+  - prefer downloaded images with a dimension above 1280 pixels
+  - automatically fall back to another available image if no 1280+ image can be downloaded
+  - run a Gemini-based relevance check on the downloaded candidate and show the validation result in the UI
   - send the downloaded image to Gemini image generation with the story `title` as the overlay prompt
   - convert each Telugu `summary` into speech audio using Gemini TTS
   - create one video per story from the generated image + audio

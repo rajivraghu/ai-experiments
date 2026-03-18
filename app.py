@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 SEARCHAPI_URL = "https://www.searchapi.io/api/v1/search"
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_AUDIO_MODEL = "gemini-2.5-flash-preview-tts"
+DEFAULT_VALIDATION_MODEL = "gemini-2.5-flash"
 DEFAULT_VOICE = "Zephyr"
 VIDEO_SIZE = (1280, 720)
 MIN_IMAGE_DIMENSION = 1280
@@ -60,6 +61,8 @@ class DownloadedImage:
     height: int
     source_url: str
     source_page: str
+    validation_summary: str
+    used_fallback: bool
 
 
 @dataclass
@@ -258,46 +261,179 @@ def normalize_image_bytes(image_bytes: bytes, fallback_format: str = "JPEG") -> 
     return buffer.getvalue(), mime_type, width, height
 
 
-def download_best_image(searchapi_key: str, query: str) -> DownloadedImage:
-    results = search_images(searchapi_key, query)
-    candidate_errors: list[str] = []
-
+def extract_image_candidates(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     for result in results:
         original = result.get("original") or {}
         image_url = str(original.get("link") or "").strip()
+        if not image_url:
+            continue
+
         width = int(original.get("width") or 0)
         height = int(original.get("height") or 0)
-        if not image_url or max(width, height) < MIN_IMAGE_DIMENSION:
+        candidates.append(
+            {
+                "image_url": image_url,
+                "width": width,
+                "height": height,
+                "source_page": str((result.get("source") or {}).get("link") or ""),
+            }
+        )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: max(candidate["width"], candidate["height"]),
+        reverse=True,
+    )
+
+
+def validate_downloaded_image(
+    api_key: str,
+    validation_model: str,
+    title: str,
+    query: str,
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[bool, str]:
+    client = get_gemini_client(api_key)
+    prompt = textwrap.dedent(
+        f"""
+        Check whether this image is a good match for the requested Telugu news item.
+
+        Title: {title}
+        Search keywords: {query}
+
+        Reply in exactly one line using this format:
+        MATCH: yes|no - short reason
+        """
+    ).strip()
+
+    response = client.models.generate_content(
+        model=validation_model,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text=prompt),
+                    types.Part.from_bytes(mime_type=mime_type, data=image_bytes),
+                ],
+            )
+        ],
+    )
+    response_text = (response.text or "").strip()
+    lowered = response_text.lower()
+    is_match = lowered.startswith("match: yes")
+    if not response_text:
+        return True, "Validation model returned an empty response, so the image was accepted."
+    return is_match, response_text
+
+
+def try_download_candidate(candidate: dict[str, Any]) -> tuple[bytes, str, int, int]:
+    response = requests.get(
+        candidate["image_url"],
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    response.raise_for_status()
+    mime_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
+    normalized_bytes, normalized_mime, actual_width, actual_height = normalize_image_bytes(
+        response.content
+    )
+    return normalized_bytes, normalized_mime or mime_type, actual_width, actual_height
+
+
+def download_best_image(
+    searchapi_key: str,
+    gemini_api_key: str,
+    validation_model: str,
+    title: str,
+    query: str,
+) -> DownloadedImage:
+    results = search_images(searchapi_key, query)
+    candidates = extract_image_candidates(results)
+    candidate_errors: list[str] = []
+    fallback_image: Optional[DownloadedImage] = None
+
+    for candidate in candidates:
+        try:
+            normalized_bytes, mime_type, actual_width, actual_height = try_download_candidate(candidate)
+        except Exception as exc:
+            candidate_errors.append(f"{candidate['image_url']}: {exc}")
             continue
 
+        is_high_res = max(actual_width, actual_height) >= MIN_IMAGE_DIMENSION
         try:
-            response = requests.get(
-                image_url,
-                timeout=30,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-            mime_type = response.headers.get("content-type", "image/jpeg").split(";")[0]
-            normalized_bytes, normalized_mime, actual_width, actual_height = normalize_image_bytes(
-                response.content
+            is_match, validation_summary = validate_downloaded_image(
+                api_key=gemini_api_key,
+                validation_model=validation_model,
+                title=title,
+                query=query,
+                image_bytes=normalized_bytes,
+                mime_type=mime_type,
             )
         except Exception as exc:
-            candidate_errors.append(f"{image_url}: {exc}")
-            continue
-
-        if max(actual_width, actual_height) < MIN_IMAGE_DIMENSION:
-            candidate_errors.append(
-                f"{image_url}: downloaded image was only {actual_width}x{actual_height}"
+            validation_summary = (
+                "Validation check failed, so the image was accepted without automated verification: "
+                f"{exc}"
             )
+            is_match = True
+
+        downloaded_image = DownloadedImage(
+            data=normalized_bytes,
+            mime_type=mime_type,
+            width=actual_width,
+            height=actual_height,
+            source_url=candidate["image_url"],
+            source_page=candidate["source_page"],
+            validation_summary=validation_summary,
+            used_fallback=not is_high_res,
+        )
+
+        if is_high_res and is_match:
+            return downloaded_image
+
+        if fallback_image is None and is_match:
+            fallback_note = (
+                "Fallback image used because no downloadable image above 1280 pixels passed the checks. "
+                f"Validation: {validation_summary}"
+            )
+            fallback_image = DownloadedImage(
+                data=downloaded_image.data,
+                mime_type=downloaded_image.mime_type,
+                width=downloaded_image.width,
+                height=downloaded_image.height,
+                source_url=downloaded_image.source_url,
+                source_page=downloaded_image.source_page,
+                validation_summary=fallback_note,
+                used_fallback=True,
+            )
+
+        if not is_match:
+            candidate_errors.append(
+                f"{candidate['image_url']}: rejected by validation check ({validation_summary})"
+            )
+
+    if fallback_image is not None:
+        return fallback_image
+
+    for candidate in candidates:
+        try:
+            normalized_bytes, mime_type, actual_width, actual_height = try_download_candidate(candidate)
+        except Exception as exc:
+            candidate_errors.append(f"{candidate['image_url']}: {exc}")
             continue
 
         return DownloadedImage(
             data=normalized_bytes,
-            mime_type=normalized_mime or mime_type,
+            mime_type=mime_type,
             width=actual_width,
             height=actual_height,
-            source_url=image_url,
-            source_page=str((result.get("source") or {}).get("link") or ""),
+            source_url=candidate["image_url"],
+            source_page=candidate["source_page"],
+            validation_summary=(
+                "Last-resort fallback image used because no candidate passed automated validation."
+            ),
+            used_fallback=True,
         )
 
     details = "\n".join(candidate_errors[:5])
@@ -413,6 +549,7 @@ def process_story_items(
     items: list[NewsItem],
     gemini_api_key: str,
     searchapi_key: str,
+    validation_model: str,
     image_model: str,
     audio_model: str,
     voice_name: str,
@@ -436,7 +573,13 @@ def process_story_items(
 
         for index, item in enumerate(items, start=1):
             advance(f"[{index}/{len(items)}] Searching and downloading image for: {item.title}")
-            source_image = download_best_image(searchapi_key, item.image_search_keywords)
+            source_image = download_best_image(
+                searchapi_key=searchapi_key,
+                gemini_api_key=gemini_api_key,
+                validation_model=validation_model,
+                title=item.title,
+                query=item.image_search_keywords,
+            )
 
             advance(f"[{index}/{len(items)}] Generating Gemini overlay image for: {item.title}")
             generated_image_bytes, generated_text = generate_image(
@@ -511,6 +654,7 @@ def render_app() -> None:
         mode = st.radio("Menu", ["Image", "Audio", "JSON Video Builder"])
         image_model = st.text_input("Image Model", value=DEFAULT_IMAGE_MODEL)
         audio_model = st.text_input("Audio Model", value=DEFAULT_AUDIO_MODEL)
+        validation_model = st.text_input("Validation Model", value=DEFAULT_VALIDATION_MODEL)
         voice_name = st.text_input("Voice Name", value=DEFAULT_VOICE)
 
     if mode == "Image":
@@ -634,6 +778,7 @@ def render_app() -> None:
                             items=items,
                             gemini_api_key=gemini_api_key,
                             searchapi_key=searchapi_key,
+                            validation_model=validation_model.strip() or DEFAULT_VALIDATION_MODEL,
                             image_model=image_model.strip(),
                             audio_model=audio_model.strip(),
                             voice_name=voice_name.strip() or DEFAULT_VOICE,
@@ -659,8 +804,11 @@ def render_app() -> None:
                                 st.markdown(
                                     f"**Downloaded source image:** {result.source_image.width}×{result.source_image.height}"
                                 )
+                                if result.source_image.used_fallback:
+                                    st.warning("Fallback image was used for this story.")
                                 st.caption(f"Search result source page: {result.source_image.source_page}")
                                 st.caption(f"Original downloaded image URL: {result.source_image.source_url}")
+                                st.caption(f"Image validation: {result.source_image.validation_summary}")
                                 st.image(
                                     result.source_image.data,
                                     caption="Downloaded source image from SearchApi result",
