@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "puppeteer-core": "^24.41.0",
     "steel-sdk": "^0.18.0"
   }
 }

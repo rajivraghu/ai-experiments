@@ -1,119 +1,79 @@
-import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import puppeteer from './node_modules/puppeteer-core/lib/esm/puppeteer/puppeteer-core.js';
 
-const STEEL_SESSION_ID = 'ed6f566a-1af3-4ce8-9d3e-c0dad8901b13';
-const CDP_ENDPOINT = `wss://connect.steel.dev?sessionId=${STEEL_SESSION_ID}`;
-const TARGET_URL = 'https://www.eenadu.net/movies';
+const STEEL_API_KEY = 'ste-xNFvD9RTtjBGnsgDBcUvh9KQDr6hi1mLUhS983MbhELbNXrJNf4a6ybrq25SNE6Ls40w1vlu2dP0U1ox79XG7DWnHHJJu2a7S0Q';
+const SESSION_ID   = '6ee28b5e-cb73-485e-a0b5-1569d5d9160e';
+const CDP_ENDPOINT = `wss://connect.steel.dev?sessionId=${SESSION_ID}&apiKey=${STEEL_API_KEY}`;
+const TARGET_URL   = 'https://www.eenadu.net/movies';
 
-async function scrapeEenaduMoviesNews() {
-  console.log(`Connecting to Steel.dev session: ${STEEL_SESSION_ID}`);
-  console.log(`CDP Endpoint: ${CDP_ENDPOINT}\n`);
+async function scrape() {
+  console.log(`Connecting to Steel session ${SESSION_ID} via CDP...`);
+  const browser = await puppeteer.connect({ browserWSEndpoint: CDP_ENDPOINT });
+  console.log('Connected.\n');
 
-  let browser;
   try {
-    browser = await chromium.connectOverCDP(CDP_ENDPOINT, { timeout: 30000 });
-    console.log('Connected to Steel browser successfully.');
+    const pages = await browser.pages();
+    const page  = pages.length > 0 ? pages[0] : await browser.newPage();
 
-    const contexts = browser.contexts();
-    const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
-    const pages = context.pages();
-    const page = pages.length > 0 ? pages[0] : await context.newPage();
-
-    console.log(`Navigating to ${TARGET_URL} ...\n`);
+    console.log(`Navigating to ${TARGET_URL} ...`);
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
 
-    // Wait for news content to load
-    await page.waitForTimeout(3000);
+    const title = await page.title();
+    console.log(`Page title: ${title}\n`);
 
-    const pageTitle = await page.title();
-    console.log(`Page Title: ${pageTitle}\n`);
-
-    // Scrape news headlines and links from eenadu.net/movies
     const news = await page.evaluate(() => {
+      const seen    = new Set();
       const results = [];
 
-      // Try various selectors commonly used by Eenadu for news items
+      const push = (text, href) => {
+        text = text.trim().replace(/\s+/g, ' ');
+        if (text.length > 10 && href && !seen.has(href)) {
+          seen.add(href);
+          results.push({ headline: text.substring(0, 200), url: href });
+        }
+      };
+
+      // Primary selectors for Eenadu news items
       const selectors = [
-        'article',
-        '.news-item',
-        '.story-item',
-        '.top-story',
-        '.district-top-story',
-        'h2 a',
-        'h3 a',
-        '.headline a',
-        '.news-head a',
-        '.news-title a',
-        '.eng-news a',
-        '[class*="story"] a',
-        '[class*="news"] a',
-        '[class*="headline"] a',
+        'article a', 'h2 a', 'h3 a', 'h4 a',
+        '.news-item a', '.story-item a', '.top-story a',
+        '.headline a', '.news-head a', '.news-title a',
+        '[class*="story"] a', '[class*="news"] a', '[class*="headline"] a',
+        '.eng-news a', '.carousel a', '.slider a',
       ];
 
-      // Collect all anchor tags that look like news links
-      const seen = new Set();
       for (const sel of selectors) {
-        const elements = document.querySelectorAll(sel);
-        for (const el of elements) {
-          const anchor = el.tagName === 'A' ? el : el.querySelector('a');
-          if (!anchor) continue;
-          const href = anchor.href || '';
-          const text = anchor.innerText?.trim() || el.innerText?.trim() || '';
-          if (
-            text.length > 10 &&
-            href &&
-            !seen.has(href) &&
-            (href.includes('eenadu') || href.startsWith('/'))
-          ) {
-            seen.add(href);
-            results.push({ headline: text.replace(/\s+/g, ' ').substring(0, 200), url: href });
-          }
-        }
-      }
-
-      // If nothing found, fall back to all meaningful anchor tags
-      if (results.length === 0) {
-        document.querySelectorAll('a').forEach((a) => {
-          const text = a.innerText?.trim() || '';
-          const href = a.href || '';
-          if (
-            text.length > 15 &&
-            href &&
-            !seen.has(href) &&
-            (href.includes('/movies') || href.includes('/telugu'))
-          ) {
-            seen.add(href);
-            results.push({ headline: text.replace(/\s+/g, ' ').substring(0, 200), url: href });
-          }
+        document.querySelectorAll(sel).forEach(a => {
+          push(a.innerText || a.textContent || '', a.href || '');
         });
       }
 
-      return results.slice(0, 30); // Return top 30 news items
+      // Fallback: any anchor with text length > 15
+      if (results.length === 0) {
+        document.querySelectorAll('a').forEach(a => {
+          push(a.innerText || a.textContent || '', a.href || '');
+        });
+      }
+
+      return results.slice(0, 30);
     });
 
-    console.log(`=== Eenadu Movies - Latest News (${news.length} items) ===\n`);
+    console.log(`=== Eenadu Movies — Latest News (${news.length} items) ===\n`);
     if (news.length === 0) {
-      console.log('No news items found with standard selectors. Dumping visible text...\n');
-      const bodyText = await page.evaluate(() => {
-        return document.body.innerText.substring(0, 3000);
-      });
-      console.log(bodyText);
+      const body = await page.evaluate(() => document.body.innerText.substring(0, 3000));
+      console.log('(No structured items found)\n', body);
     } else {
-      news.forEach((item, idx) => {
-        console.log(`${idx + 1}. ${item.headline}`);
-        console.log(`   URL: ${item.url}\n`);
+      news.forEach((item, i) => {
+        console.log(`${i + 1}. ${item.headline}`);
+        console.log(`   ${item.url}\n`);
       });
     }
 
     return news;
   } finally {
-    if (browser) {
-      await browser.close();
-      console.log('\nBrowser connection closed.');
-    }
+    await browser.disconnect();
+    console.log('Disconnected from Steel session.');
   }
 }
 
-scrapeEenaduMoviesNews().catch((err) => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+scrape().catch(err => { console.error('Error:', err.message); process.exit(1); });
